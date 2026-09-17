@@ -6,3 +6,7 @@ Build/OSCLeash.spec
 
 #Python Stuff
 __pycache__/
+.venv/
+Scripts/*.spec
+/build/
+/dist/

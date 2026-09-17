@@ -1,6 +1,9 @@
 import sys
 from cx_Freeze import setup, Executable
 
+version = 'VERSION_PLACEHOLDER'
+if 'PLACEHOLDER' in version:
+    version = '0.0.0'
 
 # Dependencies are automatically detected, but it might need
 # fine tuning.
@@ -20,7 +23,7 @@ directory_table = [
 msi_data = {
     "Directory": directory_table,
     "ProgId": [
-        ("Prog.Id", "VERSION_PLACEHOLDER", None, "OSC tool to move a player in the direction of a stretched Physbone", "IconId", None),
+        ("Prog.Id", version, None, "OSC tool to move a player in the direction of a stretched Physbone", "IconId", None),
     ],
     "Icon": [
         ("IconId", "Resources/VRChatOSCLeash.ico"),
@@ -65,7 +68,7 @@ executables = [
 ]
 
 setup(name='OSCLeash',
-      version = 'VERSION_PLACEHOLDER',
+      version = version,
       description = "OSC tool to move a player in the direction of a stretched Physbone",
       license = "MIT License",
       options = {

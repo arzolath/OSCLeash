@@ -1,12 +1,7 @@
-@REM This uses CX_Freeze to create an MSI installer file.
-copy BuildInstaller.py ..\
-cd ..\
-BuildInstaller.py bdist_msi
-
-@REM cleanup post build
-del /q BuildInstaller.py
-rmdir /s /q build
-xcopy /i /s /y /q dist Scripts\dist 
-rmdir /s /q dist
-
+@echo off
+pushd "%~dp0.."
+python setup.py bdist_msi
+set "BUILD_RESULT=%ERRORLEVEL%"
+popd
 pause
+exit /b %BUILD_RESULT%
