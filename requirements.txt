@@ -1,3 +1,2 @@
-python_osc>=1.8.0
-vgamepad>=0.0.8
-tinyoscquery@git+https://github.com/Hackebein/tinyoscquery.git
+python-osc==1.10.2
+tinyoscquery @ git+https://github.com/Hackebein/tinyoscquery.git@a2c0af468e457f106cd71a5c6fd348ae5ea5d665

@@ -1,39 +1,88 @@
 from pythonosc.udp_client import SimpleUDPClient
-from threading import Lock, Thread
-import time
+from threading import Event, RLock
+import ctypes
+import logging
 import os
-import ctypes #Required for colored error messages.
+import socket
+import time
 
 from Controllers.DataController import ConfigSettings, Leash
 
+logger = logging.getLogger(__name__)
+
+
 class Program:
+    def __init__(self):
+        self.stateLock = RLock()
+        self.wake = Event()
+        self.stopped = Event()
+        self.activeLeash = None
+        self._client = None
+        self._resetPending = False
 
-    # Class variable to determine if the program is running on a thread (Prevents multiple threads)
-    __running = False 
+    def resetLeashes(self, leashes):
+        with self.stateLock:
+            for leash in leashes:
+                leash.Grabbed = False
+                leash.Active = False
+                leash.Stretch = 0.0
+                leash.resetMovement()
+            self._resetPending = True
+        self.wake.set()
 
-    def resetProgram(self):
-        Program.__running = False 
-    
-    def updateProgram(self, runBool:bool, countValue:int):
-        Program.__running = runBool
+    def run(self, leashes, checkConnection=None):
+        settings = leashes[0].settings
+        try:
+            if not settings.XboxJoystickMovement:
+                self._client = SimpleUDPClient(settings.IP, settings.SendingPort, family=socket.AF_INET)
+            self.stopMovement(settings)
+            while not self.stopped.is_set():
+                self.wake.clear()
+                self.updateMovement(leashes)
+                if checkConnection is not None:
+                    checkConnection()
+                delay = settings.ActiveDelay if self.activeLeash else settings.InactiveDelay
+                self.wake.wait(delay)
+        finally:
+            try:
+                self.stopMovement(settings)
+            finally:
+                if self._client is not None:
+                    self._client.close()
+                    self._client = None
 
-    def leashRun(self, leash: Leash, counter:int = 0):
+    def stop(self):
+        self.stopped.set()
+        self.wake.set()
 
-        if counter == 0 and Program.__running or not leash.Active:
-            return
-        
-        if counter < 0: # Prevents int overflow possibility by resetting counter at continuation state
-            counter = 1
-        
-        statelock = Lock()
-        statelock.acquire()
+    def updateMovement(self, leashes):
+        # The receiver uses the same lock, so each output uses a consistent snapshot.
+        with self.stateLock:
+            if self._resetPending:
+                self.stopMovement(leashes[0].settings)
+                self.activeLeash = None
+                self._resetPending = False
+            previous = self.activeLeash
+            if previous is not None and not previous.Grabbed:
+                logger.info("%s dropped", previous.Name)
+                previous.Active = False
+                self.stopMovement(previous.settings)
+                self.activeLeash = None
+            if self.activeLeash is None:
+                self.activeLeash = next((leash for leash in leashes if leash.Grabbed), None)
+                if self.activeLeash is not None:
+                    self.activeLeash.Active = True
+                    logger.info("%s grabbed", self.activeLeash.Name)
+            if self.activeLeash is None:
+                return
 
-        if not leash.settings.Logging:
-            self.cls()
-            print('\x1b[1;32;40m' + 'OSCLeash is Running' + '\x1b[0m')  
-        else:
-            leash.printDirections()
+            leash = self.activeLeash
+            if leash.settings.Logging:
+                leash.printDirections()
+            vert, hori, turn, run = self.movement(leash)
+            self.leashOutput(vert, hori, turn, run, leash.settings)
 
+    def movement(self, leash):
         #Movement Math
         outputMultiplier = leash.Stretch * leash.settings.StrengthMultiplier
         VerticalOutput = self.clamp((leash.Z_Positive - leash.Z_Negative) * outputMultiplier)
@@ -41,17 +90,15 @@ class Program:
 
         Y_Combined = leash.Y_Positive + leash.Y_Negative
         #Up/Down Deadzone, stops movement if pulled too high or low.
-        if (Y_Combined) >= leash.settings.UpDownDeadzone:
+        if leash.settings.UpDownDeadzone < 1 and Y_Combined >= leash.settings.UpDownDeadzone:
             VerticalOutput = 0.0
             HorizontalOutput = 0.0
             
         #Up/Down Compensation
         if leash.settings.UpDownCompensation != 0:
-            Y_Modifier = self.clamp(1.0 - ((Y_Combined) * leash.settings.UpDownCompensation))
-            if Y_Modifier != 0.0: # prevents division by zero.
-                VerticalOutput /= Y_Modifier
-                HorizontalOutput /= Y_Modifier 
-            # This is not linear... I don't know, I think I might've failed math.
+            Y_Modifier = max(0.0001, 1.0 - Y_Combined * leash.settings.UpDownCompensation)
+            VerticalOutput /= Y_Modifier
+            HorizontalOutput /= Y_Modifier
 
         #Turning Math
         if leash.settings.TurningEnabled and leash.Stretch > leash.settings.TurningDeadzone:
@@ -103,106 +150,58 @@ class Program:
                     else:
                         TurningSpeed = 0.0
 
+                case _:
+                    TurningSpeed = 0.0
+
             TurningSpeed = self.clamp(TurningSpeed)
         else:
             TurningSpeed = 0.0
 
-        #Leash is grabbed
-        if leash.Grabbed: 
-            self.updateProgram(True, counter)
+        if not leash.Grabbed or leash.Stretch <= leash.settings.WalkDeadzone:
+            return 0.0, 0.0, 0.0, 0
+        return (self.clamp(VerticalOutput), self.clamp(HorizontalOutput),
+                TurningSpeed, int(leash.Stretch > leash.settings.RunDeadzone))
 
-            if leash.settings.Logging:
-                if leash.wasGrabbed == False:
-                    print('\x1b[1;32;40m' + f"{leash.Name} grabbed" + '\x1b[0m')
-                    leash.wasGrabbed = True
-            else:
-                print(f"{leash.Name} is grabbed")
+    def stopMovement(self, settings):
+        # Repeat the release because UDP does not guarantee delivery.
+        for attempt in range(2):
+            try:
+                self.leashOutput(0.0, 0.0, 0.0, 0, settings)
+            except OSError:
+                logger.exception("Could not send movement reset to %s:%s", settings.IP, settings.SendingPort)
+            if attempt == 0:
+                time.sleep(settings.ActiveDelay)
 
-            if leash.Stretch > leash.settings.RunDeadzone: #Running
-                self.leashOutput(VerticalOutput, HorizontalOutput, TurningSpeed, 1, leash.settings)
-            elif leash.Stretch > leash.settings.WalkDeadzone: #Walking
-                self.leashOutput(VerticalOutput, HorizontalOutput, TurningSpeed, 0, leash.settings)
-            else: #Not stretched enough to move.
-                self.leashOutput(0.0, 0.0, 0.0, 0, leash.settings)
-            
-            time.sleep(leash.settings.ActiveDelay)
-            Thread(target=self.leashRun, args=(leash, counter+1)).start()# Run thread if still grabbed
-
-        elif leash.Grabbed != leash.wasGrabbed:
-            if leash.settings.Logging:
-                print('\x1b[1;33;40m' + f"{leash.Name} dropped" + '\x1b[0m')
-            else:
-                print(f"{leash.Name} dropped")
-
-            leash.Active = False
-            leash.resetMovement()
-            # Very important stop message, if missed you'll walk forever.
-            # extra delay to prevent it from being sent too quickly for VRC to handle.
-            # fires twice because... why not? Everything breaks if you miss it.
-            for _ in range(2):
-                time.sleep(leash.settings.ActiveDelay) 
-                self.leashOutput(0.0, 0.0, 0.0, 0, leash.settings)
-
-            leash.wasGrabbed = False
-            self.resetProgram()
-        
-        else: # Only used at the start
-            if not leash.settings.Logging:
-                print("Waiting for Initial Input")
-
-            leash.Active = False
-            self.leashOutput(0.0, 0.0, 0.0, 0, leash.settings)
-            self.resetProgram()
-
-            time.sleep(leash.settings.InactiveDelay)
-
-        statelock.release()
-
-    def leashOutput(self, vert: float, hori: float, turn: float, runType: bool, settings: ConfigSettings):
-
-        oscClient = SimpleUDPClient(settings.IP, settings.SendingPort)
-
-        #TODO: Remove this.
-        if settings.XboxJoystickMovement: 
-            settings.gamepad.left_joystick_float(x_value_float=float(hori), y_value_float=float(vert))
-            if settings.TurningEnabled: 
-                settings.gamepad.right_joystick_float(x_value_float=float(turn), y_value_float=0.0)
-            if runType == 1:
-                settings.gamepad.press_button(button=settings.runButton)      
+    def leashOutput(self, vert: float, hori: float, turn: float, runType: int, settings: ConfigSettings):
+        vert, hori, turn = (float(self.clamp(value)) for value in (vert, hori, turn))
+        if settings.XboxJoystickMovement:
+            settings.gamepad.left_joystick_float(x_value_float=hori, y_value_float=vert)
+            if settings.TurningEnabled:
+                settings.gamepad.right_joystick_float(x_value_float=turn, y_value_float=0.0)
+            if runType:
+                settings.gamepad.press_button(button=settings.runButton)
             else:
                 settings.gamepad.release_button(button=settings.runButton)
             settings.gamepad.update()
+            logger.debug("Gamepad output: vertical=%.3f horizontal=%.3f turn=%.3f run=%d",
+                         vert, hori, turn, runType)
+            return
 
-        else:
-            #Normal OSC outputs  function
-            oscClient.send_message("/input/Vertical", vert)
-            oscClient.send_message("/input/Horizontal", hori)
-            if settings.TurningEnabled: 
-                oscClient.send_message("/input/LookHorizontal", turn)
-            oscClient.send_message("/input/Run", runType)
+        if self._client is None:
+            self._client = SimpleUDPClient(settings.IP, settings.SendingPort, family=socket.AF_INET)
+        messages = [("/input/Vertical", vert), ("/input/Horizontal", hori)]
+        if settings.TurningEnabled:
+            messages.append(("/input/LookHorizontal", turn))
+        messages.append(("/input/Run", int(runType)))
+        for address, value in messages:
+            self._client.send_message(address, value)
+            logger.debug("OSC TX %s:%s %s %r", settings.IP, settings.SendingPort, address, value)
 
-        if not settings.TurningEnabled: 
-            print(f"\tVert: {vert} | Hori: {hori} | Run: {runType}") 
-        else:
-            print(f"\tVert: {vert} | Hori: {hori} | Run: {runType} | Turn: {turn}")
-
-    def clamp (self, n):
+    @staticmethod
+    def clamp(n):
         return max(-1.0, min(n, 1.0))
 
-    def clampPos (self, n):
-        return max(0.0, min(n, 0.99999))
-
-    def clampNeg (self, n):
-        return max(-0.99999, min(n, 0.0))
-
-    def cls(self): # Console Clear
-        """Clears Console"""
-        os.system('cls' if os.name == 'nt' else 'clear')
-
-    def pause(self): #
-        os.system('pause' if os.name == 'nt' else 'read -n1 -r -p "Press any key to continue..."')
-
-    def setWindowTitle(self): # Set window title
+    @staticmethod
+    def setWindowTitle():
         if os.name == 'nt':
             ctypes.windll.kernel32.SetConsoleTitleW("OSCLeash")
-    

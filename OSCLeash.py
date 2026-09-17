@@ -1,114 +1,91 @@
 #!/usr/bin/env python3
-from threading import Thread
 import json
-from sys import platform
+import logging
 import os
-import time
+from pathlib import Path
+import sys
 
 from Controllers.DataController import DefaultConfig, ConfigSettings, Leash
 from Controllers.PackageController import Package
 from Controllers.ThreadController import Program
 
-# Make sure to change this to the correct version number on releases.
-__version__ = "v"+"VERSION_PLACEHOLDER"
-
-def createDefaultConfigFile(configPath): # Creates a default config
-    try:
-        directory: str = os.path.dirname(configPath)
-
-        # Create parent directories of `configPath` if they don't exist.
-        if not os.path.isdir(directory):
-            os.makedirs(directory)
-
-        with open(configPath, "w") as cf:
-            json.dump(DefaultConfig, cf, indent=4)
-
-        print("Default config file created\n")
-        time.sleep(2)
-
-    except Exception as e:
-        print(e)
-        program.pause()
-        exit()
+# Replaced by the release build.
+__version__ = "v" + "VERSION_PLACEHOLDER"
+logger = logging.getLogger(__name__)
 
 
-if __name__ == "__main__":
+def configFilePath():
+    override = os.environ.get('OSCLEASH_CONFIG_PATH')
+    if override:
+        return Path(override).expanduser().resolve()
+    if sys.platform == 'win32':
+        base = Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local')
+        return base / 'Programs' / 'OSCLeash' / 'Config.json'
+    base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    return base / 'OSCLeash' / 'Config.json'
 
-    #*************Setup*************#
+
+def createDefaultConfigFile(configPath):
+    path = Path(configPath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('x', encoding='utf-8') as configFile:
+        json.dump(DefaultConfig, configFile, indent=4)
+        configFile.write('\n')
+    logger.info("Created default config at %s", path)
+
+
+def configureLogging(verbose=False):
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO,
+                        format='%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S',
+                        stream=sys.stdout, force=True)
+    for name in ('zeroconf', 'asyncio', 'urllib3'):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def main():
+    configureLogging()
     program = Program()
     program.setWindowTitle()
-    program.cls()
-
-    if "PLACEHOLDER" in __version__:
-        __version__ = "(Local Build)"
-
-    print('\x1b[1;32;40m' + f"OSCLeash {__version__}" + '\x1b[0m')
-
-    # Choose configuration path based on operating system if no override is set
-    configPathOverride = os.environ.get('OSCLEASH_CONFIG_PATH')
-    if configPathOverride is not None:
-        configPath = configPathOverride
-    elif platform == 'win32':
-        configPath = f"{os.environ.get('LocalAppData')}\Programs\OSCLeash\Config.json"
-    elif platform == 'linux': 
-        configPath = f"{os.environ.get('XDG_CONFIG_HOME', f"{os.environ.get('HOME')}/.config/")}/OSCLeash/Config.json"
-
-    # Test if Config file exists. Create the default if it does not.
-    if not os.path.isfile(configPath):
-        # print error message in red
-        print('\x1b[1;31;40m' + "Config file was not found...", "\nCreating default config file..." + '\x1b[0m')
-        createDefaultConfigFile(configPath)
-    else:
-        print(f"Config file found at {configPath}\n")
-
-    # load settings
+    version = '(Local Build)' if 'PLACEHOLDER' in __version__ else __version__
+    logger.info("OSCLeash %s", version)
+    package = None
     try:
-        configData = json.load(open(configPath))
-    except Exception as e:
-        print('\x1b[1;31;40m' + 'Malformed Config.json file. Fix or delete it to generate a new one.' + '\x1b[0m')
-        print(f"{e}\nDefault Config will be loaded.\n")
+        configPath = configFilePath()
+        logger.info("Config: %s", configPath)
+        if not configPath.is_file():
+            createDefaultConfigFile(configPath)
+        with configPath.open(encoding='utf-8-sig') as configFile:
+            configData = json.load(configFile)
+        settings = ConfigSettings(configData)
+        configureLogging(settings.VerboseLogging)
+        settings.printInfo()
 
-        configData = DefaultConfig
-        program.pause()
-        
-    settings = ConfigSettings(configData)
+        if settings.XboxJoystickMovement:
+            try:
+                import vgamepad as vg
+                settings.addGamepadControls(vg.VX360Gamepad(), vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
+            except Exception as exc:
+                logger.warning("Gamepad initialization failed: %s. Using OSC movement.", exc)
+                settings.XboxJoystickMovement = False
 
-    time.sleep(1)
-
-    # TODO: Remove Xbox support if not needed
-    if settings.XboxJoystickMovement:
-        try:
-            import vgamepad as vg
-            settings.addGamepadControls(vg.VX360Gamepad(), vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER) # Add emulated gamepad
-        except Exception as e:
-            print('\x1b[1;31;40m' + f'Error: {e}\nWarning: Switching to default OSC settings. Please wait...\n Check documentation for controller emulator tool.' + '\x1b[0m')
-            settings.XboxJoystickMovement = False
-            program.pause()
-
-    # Collect Data for leash
-    leashes = []
-    for leashName in configData["PhysboneParameters"]:
-        leashes.append(Leash(leashName, configData["DirectionalParameters"], settings))
-
-    try:
-        # Manage data coming in
-        if len(leashes) == 0: raise Exception("No leashes found. Please update config file.")
-        package = Package(leashes, configData['UseOSCQuery'])
+        leashes = [Leash(name, settings.DirectionalParameters, settings) for name in settings.Leashes]
+        package = Package(leashes, settings.UseOSCQuery, program)
         package.listen()
+        package.start(settings.BindIP, settings.ListeningPort)
+        logger.info("Started, awaiting input. Press Ctrl+C to stop.")
+        program.run(leashes, package.checkConnection)
+        return 0
+    except KeyboardInterrupt:
+        logger.info("Stopping OSCLeash")
+        return 0
+    except Exception as exc:
+        logger.error("OSCLeash could not continue: %s", exc, exc_info=logger.isEnabledFor(logging.DEBUG))
+        return 1
+    finally:
+        program.stop()
+        if package is not None:
+            package.close()
 
-        # Start server
-        serverThread = Thread(target=package.runServer, args=(settings.IP, settings.ListeningPort))
-        serverThread.start()
-        time.sleep(.1)
-        
-        #initialize input
-        if serverThread.is_alive():
-            leashes[0].Active = True
-            print("Started, awaiting input...")
-            Thread(target=program.leashRun, args=(leashes[0],)).start()
-        else: raise Exception()
-            
-    except Exception as e:
-        print(e)
-        program.pause()
-        os.execl(sys.executable, sys.executable, *sys.argv)
+
+if __name__ == '__main__':
+    sys.exit(main())
